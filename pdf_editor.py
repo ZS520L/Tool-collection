@@ -1,3 +1,10 @@
+"""
+PDF编辑器 - PyQt5实时预览
+============================
+支持文字擦除、黑白转换、添加可拖动文字标签（自定义字体/大小/颜色）、
+水平垂直居中对齐，多行文字编辑，实时预览后导出PDF
+"""
+
 import sys
 import fitz  # PyMuPDF
 import numpy as np
@@ -5,10 +12,167 @@ from PIL import Image
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QFileDialog, QScrollArea, QToolBar,
-    QAction, QSpinBox, QMessageBox, QStatusBar, QComboBox
+    QAction, QSpinBox, QMessageBox, QStatusBar, QComboBox,
+    QFontComboBox, QColorDialog, QInputDialog, QLineEdit,
+    QTextEdit, QDialog, QDialogButtonBox
 )
-from PyQt5.QtCore import Qt, QRect, QPoint, pyqtSignal
-from PyQt5.QtGui import QPixmap, QImage, QPainter, QPen, QColor, QCursor, QKeySequence
+from PyQt5.QtCore import Qt, QRect, QPoint, pyqtSignal, QSize
+from PyQt5.QtGui import QPixmap, QImage, QPainter, QPen, QColor, QCursor, QKeySequence, QFont, QFontDatabase
+
+
+class MultiLineTextDialog(QDialog):
+    """多行文字输入对话框"""
+    def __init__(self, parent=None, title="编辑文字", label="文字内容:", text=""):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.setMinimumSize(400, 250)
+        self.setStyleSheet(
+            "QDialog { background: #353535; }"
+            "QLabel { color: white; }"
+            "QTextEdit { color: white; background: #1a1a1a; border: 1px solid #555; padding: 4px; font-size: 13px; }"
+            "QPushButton { color: white; background: #353535; border: 1px solid #555; padding: 6px 20px; }"
+            "QPushButton:hover { background: #454545; }"
+        )
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel(label))
+        self.text_edit = QTextEdit()
+        self.text_edit.setPlainText(text)
+        self.text_edit.setAcceptRichText(False)
+        layout.addWidget(self.text_edit)
+        btn_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        btn_box.accepted.connect(self.accept)
+        btn_box.rejected.connect(self.reject)
+        layout.addWidget(btn_box)
+
+    def get_text(self):
+        return self.text_edit.toPlainText()
+
+
+class DraggableText(QLabel):
+    """可拖动的文字标签"""
+    moved = pyqtSignal()  # 位置变化信号
+    selected = pyqtSignal(object)  # 选中信号
+    deleted = pyqtSignal(object)  # 删除信号
+
+    def __init__(self, text, font, color, parent=None):
+        super().__init__(text, parent)
+        self._font = font
+        self._color = color
+        self._dragging = False
+        self._drag_offset = QPoint()
+        self._scale = 1.0
+        # 原始坐标（相对于未缩放的pixmap）
+        self._orig_x = 0
+        self._orig_y = 0
+        self._is_selected = False
+
+        self.setFont(font)
+        self._update_style()
+        self.adjustSize()
+        self.setCursor(QCursor(Qt.OpenHandCursor))
+        self.setMouseTracking(True)
+        self.show()
+
+    def _update_style(self):
+        """更新样式"""
+        r, g, b = self._color.red(), self._color.green(), self._color.blue()
+        border = "2px dashed #0078D7" if self._is_selected else "1px dashed rgba(128,128,128,80)"
+        bg = "rgba(0,120,215,20)" if self._is_selected else "transparent"
+        self.setStyleSheet(
+            f"color: rgb({r},{g},{b}); background: {bg}; border: {border}; padding: 2px;"
+        )
+
+    def set_selected(self, selected):
+        self._is_selected = selected
+        self._update_style()
+
+    def set_scale(self, scale):
+        """更新缩放并调整显示"""
+        self._scale = scale
+        scaled_font = QFont(self._font)
+        scaled_font.setPointSizeF(self._font.pointSizeF() * scale)
+        self.setFont(scaled_font)
+        self.adjustSize()
+        self.move(int(self._orig_x * scale), int(self._orig_y * scale))
+
+    def set_orig_pos(self, x, y):
+        """设置原始坐标"""
+        self._orig_x = x
+        self._orig_y = y
+        self.move(int(x * self._scale), int(y * self._scale))
+
+    def get_orig_pos(self):
+        return self._orig_x, self._orig_y
+
+    def get_text_info(self):
+        """返回文字信息字典"""
+        return {
+            'type': 'text',
+            'text': self.text(),
+            'font_family': self._font.family(),
+            'font_size': self._font.pointSizeF(),
+            'font_bold': self._font.bold(),
+            'color': self._color,
+            'orig_x': self._orig_x,
+            'orig_y': self._orig_y,
+        }
+
+    def update_text(self, text):
+        self.setText(text)
+        self.adjustSize()
+
+    def update_font(self, font):
+        self._font = font
+        scaled_font = QFont(font)
+        scaled_font.setPointSizeF(font.pointSizeF() * self._scale)
+        self.setFont(scaled_font)
+        self.adjustSize()
+
+    def update_color(self, color):
+        self._color = color
+        self._update_style()
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self._dragging = True
+            self._drag_offset = event.pos()
+            self.setCursor(QCursor(Qt.ClosedHandCursor))
+            self.selected.emit(self)
+            self.raise_()
+            event.accept()
+
+    def mouseMoveEvent(self, event):
+        if self._dragging:
+            new_pos = self.mapToParent(event.pos() - self._drag_offset)
+            self.move(new_pos)
+            # 更新原始坐标
+            self._orig_x = new_pos.x() / self._scale
+            self._orig_y = new_pos.y() / self._scale
+            event.accept()
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton and self._dragging:
+            self._dragging = False
+            self.setCursor(QCursor(Qt.OpenHandCursor))
+            self.moved.emit()
+            event.accept()
+
+    def mouseDoubleClickEvent(self, event):
+        """双击编辑文字"""
+        dialog = MultiLineTextDialog(self, title="编辑文字", label="文字内容:", text=self.text())
+        if dialog.exec_():
+            text = dialog.get_text()
+            if text:
+                self.update_text(text)
+                self.moved.emit()
+        event.accept()
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key_Delete or event.key() == Qt.Key_Backspace:
+            self.deleted.emit(self)
+            event.accept()
+        else:
+            super().keyPressEvent(event)
 
 
 class PDFPage:
@@ -17,7 +181,8 @@ class PDFPage:
         self.page = page
         self.page_num = page_num
         self.dpi = dpi
-        self.modifications = []  # 存储修改记录: {'type': 'erase'/'grayscale', 'rect': QRect, 'color': QColor}
+        self.modifications = []  # 存储修改记录: {'type': 'erase'/'grayscale'/'text', 'rect': QRect, 'color': QColor}
+        self.text_items = []  # 文字标签信息列表
         self._pixmap = None
         self._original_pixmap = None
         
@@ -109,6 +274,7 @@ class PDFPage:
 class PDFViewer(QLabel):
     """PDF页面查看器，支持框选"""
     selection_made = pyqtSignal(QRect)  # 框选完成信号
+    text_selected = pyqtSignal(object)  # 文字标签被选中信号
     
     def __init__(self):
         super().__init__()
@@ -123,18 +289,28 @@ class PDFViewer(QLabel):
         self._selection_end = QPoint()
         self._current_selection = QRect()
         self._show_selection = False
+        self._text_labels = []  # 当前页面的DraggableText列表
+        self._selected_text = None  # 当前选中的文字标签
         
         self.setMouseTracking(True)
         
     def set_page(self, pdf_page):
         """设置要显示的PDF页面"""
+        # 保存当前页面的文字信息
+        self._save_text_to_page()
+        # 清除旧的文字标签控件
+        self._clear_text_labels()
         self._pdf_page = pdf_page
         self.update_display()
+        # 从页面数据恢复文字标签
+        self._restore_text_from_page()
     
     def set_scale(self, scale):
         """设置缩放比例"""
         self._scale = scale
         self.update_display()
+        for label in self._text_labels:
+            label.set_scale(scale)
     
     def update_display(self):
         """更新显示"""
@@ -150,9 +326,94 @@ class PDFViewer(QLabel):
         )
         self.setPixmap(scaled_pixmap)
         self.setFixedSize(scaled_pixmap.size())
+
+    def add_text_label(self, text, font, color, x=50, y=50):
+        """添加一个可拖动的文字标签"""
+        label = DraggableText(text, font, color, parent=self)
+        label.set_scale(self._scale)
+        label.set_orig_pos(x, y)
+        label.selected.connect(self._on_text_selected)
+        label.moved.connect(self._on_text_moved)
+        label.deleted.connect(self._on_text_deleted)
+        label.setFocusPolicy(Qt.ClickFocus)
+        self._text_labels.append(label)
+        self._on_text_selected(label)
+        return label
+
+    def _on_text_selected(self, label):
+        """文字标签被选中"""
+        if self._selected_text and self._selected_text is not label:
+            self._selected_text.set_selected(False)
+        self._selected_text = label
+        label.set_selected(True)
+        self.text_selected.emit(label)
+
+    def _on_text_moved(self):
+        """文字标签位置变化"""
+        pass
+
+    def _on_text_deleted(self, label):
+        """删除文字标签"""
+        if label in self._text_labels:
+            self._text_labels.remove(label)
+        if self._selected_text is label:
+            self._selected_text = None
+        label.deleteLater()
+
+    def deselect_text(self):
+        """取消选中文字"""
+        if self._selected_text:
+            self._selected_text.set_selected(False)
+            self._selected_text = None
+
+    def get_selected_text(self):
+        return self._selected_text
+
+    def get_text_labels(self):
+        return self._text_labels
+
+    def _save_text_to_page(self):
+        """将当前文字标签信息保存到PDFPage"""
+        if self._pdf_page is None:
+            return
+        self._pdf_page.text_items = [lbl.get_text_info() for lbl in self._text_labels]
+
+    def _restore_text_from_page(self):
+        """从PDFPage恢复文字标签"""
+        if self._pdf_page is None:
+            return
+        for info in self._pdf_page.text_items:
+            font = QFont(info['font_family'], int(info['font_size']))
+            font.setBold(info.get('font_bold', False))
+            label = DraggableText(info['text'], font, info['color'], parent=self)
+            label.set_scale(self._scale)
+            label.set_orig_pos(info['orig_x'], info['orig_y'])
+            label.selected.connect(self._on_text_selected)
+            label.moved.connect(self._on_text_moved)
+            label.deleted.connect(self._on_text_deleted)
+            label.setFocusPolicy(Qt.ClickFocus)
+            self._text_labels.append(label)
+
+    def _clear_text_labels(self):
+        """清除所有文字标签控件"""
+        for label in self._text_labels:
+            label.deleteLater()
+        self._text_labels.clear()
+        self._selected_text = None
+
+    def remove_last_text(self):
+        """移除最后添加的文字标签，返回是否成功"""
+        if self._text_labels:
+            label = self._text_labels.pop()
+            if self._selected_text is label:
+                self._selected_text = None
+            label.deleteLater()
+            return True
+        return False
     
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton and self._pdf_page:
+            self.deselect_text()
             self._selecting = True
             self._selection_start = event.pos()
             self._selection_end = event.pos()
@@ -238,6 +499,7 @@ class PDFEditorWindow(QMainWindow):
         self._current_page_idx = 0
         self._fill_color = QColor(255, 255, 255)  # 默认白色填充
         self._source_file_path = None  # 保存源文件路径
+        self._text_color = QColor(0, 0, 0)  # 默认文字颜色：黑色
         
         self._init_ui()
         self._connect_signals()
@@ -309,6 +571,72 @@ class PDFEditorWindow(QMainWindow):
         self.zoom_combo.setCurrentText("100%")
         toolbar.addWidget(self.zoom_combo)
         
+        # 文字工具栏
+        text_toolbar = QToolBar("文字工具栏")
+        text_toolbar.setMovable(False)
+        self.addToolBarBreak()
+        self.addToolBar(text_toolbar)
+        
+        # 添加文字按钮
+        self.action_add_text = QAction("🔤 添加文字 (T)", self)
+        self.action_add_text.setShortcut(QKeySequence("T"))
+        self.action_add_text.setEnabled(False)
+        text_toolbar.addAction(self.action_add_text)
+        
+        # 删除选中文字
+        self.action_del_text = QAction("❌ 删除文字", self)
+        self.action_del_text.setEnabled(False)
+        text_toolbar.addAction(self.action_del_text)
+        
+        text_toolbar.addSeparator()
+        
+        # 字体选择
+        text_toolbar.addWidget(QLabel(" 字体: "))
+        self.font_combo = QFontComboBox()
+        self.font_combo.setCurrentFont(QFont("SimSun"))
+        self.font_combo.setMinimumWidth(150)
+        text_toolbar.addWidget(self.font_combo)
+        
+        # 字号
+        text_toolbar.addWidget(QLabel(" 字号: "))
+        self.font_size_spin = QSpinBox()
+        self.font_size_spin.setMinimum(6)
+        self.font_size_spin.setMaximum(200)
+        self.font_size_spin.setValue(14)
+        self.font_size_spin.setSuffix(" pt")
+        text_toolbar.addWidget(self.font_size_spin)
+        
+        # 加粗
+        self.action_bold = QAction("B", self)
+        self.action_bold.setCheckable(True)
+        self.action_bold.setToolTip("加粗")
+        font_bold = QFont()
+        font_bold.setBold(True)
+        text_toolbar.addAction(self.action_bold)
+        
+        text_toolbar.addSeparator()
+        
+        # 文字颜色按钮
+        self.btn_text_color = QPushButton(" 文字颜色 ")
+        self.btn_text_color.setStyleSheet(
+            "QPushButton { background-color: #000000; color: white; border: 1px solid #888; padding: 3px 8px; }"
+        )
+        self.btn_text_color.setToolTip("选择文字颜色")
+        text_toolbar.addWidget(self.btn_text_color)
+        
+        text_toolbar.addSeparator()
+        
+        # 对齐按钮
+        self.action_center_h = QAction("⬌ 水平居中", self)
+        self.action_center_h.setToolTip("将选中文字水平居中于页面")
+        self.action_center_h.setEnabled(False)
+        text_toolbar.addAction(self.action_center_h)
+        
+        self.action_center_v = QAction("⬍ 垂直居中", self)
+        self.action_center_v.setToolTip("将选中文字垂直居中于页面")
+        self.action_center_v.setEnabled(False)
+        text_toolbar.addAction(self.action_center_v)
+        
         # 中央区域
         central = QWidget()
         self.setCentralWidget(central)
@@ -328,7 +656,7 @@ class PDFEditorWindow(QMainWindow):
         self.statusBar().showMessage("请打开PDF文件")
         
         # 提示标签
-        hint_label = QLabel("快捷键: W下一页(循环) | ←/→换页 | E擦除 | G转黑白 | Ctrl+Z撤销")
+        hint_label = QLabel("快捷键: W下一页(循环) | ←/→换页 | E擦除 | G转黑白 | T添加文字 | 双击文字编辑 | Del删除文字 | Ctrl+Z撤销")
         hint_label.setStyleSheet("color: #888; padding: 5px;")
         layout.addWidget(hint_label)
     
@@ -342,6 +670,16 @@ class PDFEditorWindow(QMainWindow):
         self.page_spin.valueChanged.connect(self.go_to_page)
         self.zoom_combo.currentTextChanged.connect(self.change_zoom)
         self.viewer.selection_made.connect(self.on_selection_made)
+        # 文字工具信号
+        self.action_add_text.triggered.connect(self.add_text)
+        self.action_del_text.triggered.connect(self.delete_selected_text)
+        self.btn_text_color.clicked.connect(self.pick_text_color)
+        self.font_combo.currentFontChanged.connect(self._on_font_changed)
+        self.font_size_spin.valueChanged.connect(self._on_font_size_changed)
+        self.action_bold.toggled.connect(self._on_bold_changed)
+        self.viewer.text_selected.connect(self._on_text_label_selected)
+        self.action_center_h.triggered.connect(self.center_text_horizontal)
+        self.action_center_v.triggered.connect(self.center_text_vertical)
     
     def open_pdf(self):
         """打开PDF文件"""
@@ -367,6 +705,7 @@ class PDFEditorWindow(QMainWindow):
             
             self.action_save.setEnabled(True)
             self.action_undo.setEnabled(True)
+            self.action_add_text.setEnabled(True)
             
             self._show_current_page()
             self.statusBar().showMessage(f"已打开: {file_path}")
@@ -497,12 +836,139 @@ class PDFEditorWindow(QMainWindow):
             return
         
         page = self._pages[self._current_page_idx]
+        # 先尝试撤销文字标签
+        if self.viewer.remove_last_text():
+            self.statusBar().showMessage("已撤销文字")
+            return
         if page.undo_last():
             self.viewer.update_display()
             self.statusBar().showMessage("已撤销")
         else:
             self.statusBar().showMessage("没有可撤销的操作")
     
+    def _get_current_font(self):
+        """获取当前工具栏设置的字体"""
+        font = QFont(self.font_combo.currentFont().family(), self.font_size_spin.value())
+        font.setBold(self.action_bold.isChecked())
+        return font
+
+    def add_text(self):
+        """添加文字标签到当前页面"""
+        if not self._pages:
+            return
+        dialog = MultiLineTextDialog(self, title="添加文字", label="请输入文字内容（支持换行）:")
+        if not dialog.exec_():
+            return
+        text = dialog.get_text()
+        if not text:
+            return
+        font = self._get_current_font()
+        self.viewer.add_text_label(text, font, self._text_color)
+        self.statusBar().showMessage("已添加文字，拖动可移动位置，双击可编辑")
+    
+    def delete_selected_text(self):
+        """删除选中的文字标签"""
+        label = self.viewer.get_selected_text()
+        if label:
+            self.viewer._on_text_deleted(label)
+            self.action_del_text.setEnabled(False)
+            self.statusBar().showMessage("已删除文字")
+        else:
+            self.statusBar().showMessage("请先选中一个文字标签")
+
+    def pick_text_color(self):
+        """选择文字颜色"""
+        color = QColorDialog.getColor(self._text_color, self, "选择文字颜色")
+        if color.isValid():
+            self._text_color = color
+            r, g, b = color.red(), color.green(), color.blue()
+            # 根据亮度决定按钮文字颜色
+            lum = 0.299 * r + 0.587 * g + 0.114 * b
+            text_col = "white" if lum < 128 else "black"
+            self.btn_text_color.setStyleSheet(
+                f"QPushButton {{ background-color: rgb({r},{g},{b}); color: {text_col}; border: 1px solid #888; padding: 3px 8px; }}"
+            )
+            # 如果有选中的文字，实时更新颜色
+            label = self.viewer.get_selected_text()
+            if label:
+                label.update_color(color)
+
+    def _on_font_changed(self, font):
+        """字体改变时更新选中文字"""
+        label = self.viewer.get_selected_text()
+        if label:
+            new_font = QFont(font.family(), self.font_size_spin.value())
+            new_font.setBold(self.action_bold.isChecked())
+            label.update_font(new_font)
+
+    def _on_font_size_changed(self, size):
+        """字号改变时更新选中文字"""
+        label = self.viewer.get_selected_text()
+        if label:
+            new_font = QFont(self.font_combo.currentFont().family(), size)
+            new_font.setBold(self.action_bold.isChecked())
+            label.update_font(new_font)
+
+    def _on_bold_changed(self, checked):
+        """加粗切换时更新选中文字"""
+        label = self.viewer.get_selected_text()
+        if label:
+            new_font = QFont(self.font_combo.currentFont().family(), self.font_size_spin.value())
+            new_font.setBold(checked)
+            label.update_font(new_font)
+
+    def _on_text_label_selected(self, label):
+        """文字标签被选中时，同步工具栏状态"""
+        self.action_del_text.setEnabled(True)
+        self.action_center_h.setEnabled(True)
+        self.action_center_v.setEnabled(True)
+        info = label.get_text_info()
+        # 临时断开信号避免循环
+        self.font_combo.blockSignals(True)
+        self.font_size_spin.blockSignals(True)
+        self.action_bold.blockSignals(True)
+        
+        self.font_combo.setCurrentFont(QFont(info['font_family']))
+        self.font_size_spin.setValue(int(info['font_size']))
+        self.action_bold.setChecked(info.get('font_bold', False))
+        self._text_color = info['color']
+        r, g, b = info['color'].red(), info['color'].green(), info['color'].blue()
+        lum = 0.299 * r + 0.587 * g + 0.114 * b
+        text_col = "white" if lum < 128 else "black"
+        self.btn_text_color.setStyleSheet(
+            f"QPushButton {{ background-color: rgb({r},{g},{b}); color: {text_col}; border: 1px solid #888; padding: 3px 8px; }}"
+        )
+        
+        self.font_combo.blockSignals(False)
+        self.font_size_spin.blockSignals(False)
+        self.action_bold.blockSignals(False)
+
+    def center_text_horizontal(self):
+        """将选中文字水平居中于页面"""
+        label = self.viewer.get_selected_text()
+        if not label or not self._pages:
+            return
+        page = self._pages[self._current_page_idx]
+        pixmap = page.get_pixmap()
+        page_width = pixmap.width()
+        text_width = label.width() / label._scale  # 原始宽度
+        new_x = (page_width - text_width) / 2
+        label.set_orig_pos(new_x, label._orig_y)
+        self.statusBar().showMessage("已水平居中")
+
+    def center_text_vertical(self):
+        """将选中文字垂直居中于页面"""
+        label = self.viewer.get_selected_text()
+        if not label or not self._pages:
+            return
+        page = self._pages[self._current_page_idx]
+        pixmap = page.get_pixmap()
+        page_height = pixmap.height()
+        text_height = label.height() / label._scale  # 原始高度
+        new_y = (page_height - text_height) / 2
+        label.set_orig_pos(label._orig_x, new_y)
+        self.statusBar().showMessage("已垂直居中")
+
     def _generate_output_filename(self):
         """生成输出文件名（原文件名+1）"""
         import os
@@ -531,6 +997,9 @@ class PDFEditorWindow(QMainWindow):
         if not self._doc:
             return
         
+        # 保存当前页面的文字标签信息
+        self.viewer._save_text_to_page()
+        
         # 自动生成默认文件名
         default_path = self._generate_output_filename()
         
@@ -552,7 +1021,25 @@ class PDFEditorWindow(QMainWindow):
                 QApplication.processEvents()
                 
                 # 获取修改后的pixmap
-                qt_pixmap = page_data.get_pixmap()
+                qt_pixmap = page_data.get_pixmap().copy()
+                
+                # 将文字标签绘制到pixmap上
+                if page_data.text_items:
+                    painter = QPainter(qt_pixmap)
+                    painter.setRenderHint(QPainter.Antialiasing)
+                    painter.setRenderHint(QPainter.TextAntialiasing)
+                    for info in page_data.text_items:
+                        font = QFont(info['font_family'], int(info['font_size']))
+                        font.setBold(info.get('font_bold', False))
+                        painter.setFont(font)
+                        painter.setPen(info['color'])
+                        # +3 补偿DraggableText的border(1px)+padding(2px)偏移
+                        draw_x = int(info['orig_x']) + 3
+                        draw_y = int(info['orig_y']) + 3
+                        # 使用QRect绘制支持多行文字
+                        text_rect = QRect(draw_x, draw_y, qt_pixmap.width() - draw_x, qt_pixmap.height() - draw_y)
+                        painter.drawText(text_rect, Qt.AlignLeft | Qt.AlignTop, info['text'])
+                    painter.end()
                 
                 # QPixmap -> QImage -> 临时PNG文件 -> PyMuPDF
                 img = qt_pixmap.toImage()
