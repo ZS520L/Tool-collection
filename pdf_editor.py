@@ -1013,6 +1013,11 @@ class PDFEditorWindow(QMainWindow):
         QApplication.processEvents()
         
         try:
+            import tempfile
+            import os
+            
+            export_dpi = 300  # 导出DPI，比显示DPI更高以保证清晰度
+            
             # 创建新文档
             new_doc = fitz.open()
             
@@ -1020,55 +1025,76 @@ class PDFEditorWindow(QMainWindow):
                 self.statusBar().showMessage(f"正在处理第 {idx+1}/{len(self._pages)} 页...")
                 QApplication.processEvents()
                 
-                # 获取修改后的pixmap
-                qt_pixmap = page_data.get_pixmap().copy()
+                has_modifications = len(page_data.modifications) > 0
+                has_text = len(page_data.text_items) > 0
                 
-                # 将文字标签绘制到pixmap上
-                if page_data.text_items:
+                if not has_modifications and not has_text:
+                    # 未修改的页面：直接从源PDF复制，保留矢量内容
+                    new_doc.insert_pdf(self._doc, from_page=idx, to_page=idx)
+                    continue
+                
+                # 修改过的页面：以高DPI重新渲染
+                mat = fitz.Matrix(export_dpi / 72, export_dpi / 72)
+                pix = page_data.page.get_pixmap(matrix=mat)
+                qt_img = QImage(pix.samples, pix.width, pix.height, pix.stride, QImage.Format_RGB888)
+                qt_pixmap = QPixmap.fromImage(qt_img.copy())
+                
+                # 重新应用擦除/灰度修改（按导出DPI缩放坐标）
+                scale_ratio = export_dpi / page_data.dpi
+                if has_modifications:
+                    painter = QPainter(qt_pixmap)
+                    for mod in page_data.modifications:
+                        r = mod['rect']
+                        scaled_rect = QRect(
+                            int(r.x() * scale_ratio), int(r.y() * scale_ratio),
+                            int(r.width() * scale_ratio), int(r.height() * scale_ratio)
+                        )
+                        if mod['type'] == 'erase':
+                            painter.fillRect(scaled_rect, mod.get('color', QColor(255, 255, 255)))
+                        elif mod['type'] == 'grayscale':
+                            # 取出区域转灰度
+                            region_img = qt_pixmap.toImage().copy(scaled_rect)
+                            for y in range(region_img.height()):
+                                for x in range(region_img.width()):
+                                    c = region_img.pixelColor(x, y)
+                                    gray = int(0.299 * c.red() + 0.587 * c.green() + 0.114 * c.blue())
+                                    region_img.setPixelColor(x, y, QColor(gray, gray, gray))
+                            painter.drawImage(scaled_rect, region_img)
+                    painter.end()
+                
+                # 绘制文字标签
+                if has_text:
                     painter = QPainter(qt_pixmap)
                     painter.setRenderHint(QPainter.Antialiasing)
                     painter.setRenderHint(QPainter.TextAntialiasing)
                     for info in page_data.text_items:
                         font = QFont(info['font_family'], int(info['font_size']))
                         font.setBold(info.get('font_bold', False))
+                        # 按导出DPI与显示DPI的比例缩放字体
+                        font.setPointSizeF(info['font_size'] * scale_ratio)
                         painter.setFont(font)
                         painter.setPen(info['color'])
-                        # +3 补偿DraggableText的border(1px)+padding(2px)偏移
-                        draw_x = int(info['orig_x']) + 3
-                        draw_y = int(info['orig_y']) + 3
-                        # 使用QRect绘制支持多行文字
+                        draw_x = int(info['orig_x'] * scale_ratio) + 3
+                        draw_y = int(info['orig_y'] * scale_ratio) + 3
                         text_rect = QRect(draw_x, draw_y, qt_pixmap.width() - draw_x, qt_pixmap.height() - draw_y)
                         painter.drawText(text_rect, Qt.AlignLeft | Qt.AlignTop, info['text'])
                     painter.end()
                 
-                # QPixmap -> QImage -> 临时PNG文件 -> PyMuPDF
-                img = qt_pixmap.toImage()
-                img = img.convertToFormat(QImage.Format_RGB888)
-                
-                # 保存为临时PNG
-                import tempfile
-                import os
-                temp_file = tempfile.NamedTemporaryFile(suffix='.png', delete=False)
+                # 导出为JPEG（体积更小）
+                img = qt_pixmap.toImage().convertToFormat(QImage.Format_RGB888)
+                temp_file = tempfile.NamedTemporaryFile(suffix='.jpg', delete=False)
                 temp_path = temp_file.name
                 temp_file.close()
+                img.save(temp_path, 'JPEG', 95)
                 
-                img.save(temp_path, 'PNG')
-                
-                # 计算PDF页面尺寸（点）
+                # 创建新页面并插入图像
                 orig_page = page_data.page
-                pdf_width = orig_page.rect.width
-                pdf_height = orig_page.rect.height
-                
-                # 创建新页面
-                new_page = new_doc.new_page(width=pdf_width, height=pdf_height)
-                
-                # 插入图像
+                new_page = new_doc.new_page(width=orig_page.rect.width, height=orig_page.rect.height)
                 new_page.insert_image(new_page.rect, filename=temp_path)
                 
-                # 删除临时文件
                 os.unlink(temp_path)
             
-            new_doc.save(file_path)
+            new_doc.save(file_path, deflate=True, garbage=4)
             new_doc.close()
             
             self.statusBar().showMessage(f"已导出: {file_path}")
